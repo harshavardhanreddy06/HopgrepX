@@ -1,3 +1,28 @@
+#!/usr/bin/env python3
+"""
+hopgrepX - Fast sorted log file search with adaptive indexing
+Version: 1.0.0 (Production Release)
+
+Features:
+- Fast k-ary search for sorted files (timestamp/number/string keys)
+- Adaptive ZoneMap indexing (.hop.idx sidecar files)
+- Parallel multi-file search
+- SQL-like filter expressions (--where)
+- JSON output mode (--json)
+
+Usage:
+  hopgrepX.py <files> <pattern>                     # Substring search
+  hopgrepX.py <files> --eq <key>                    # Exact match
+  hopgrepX.py <files> --range <start> <end>         # Range search
+  hopgrepX.py <files> --prefix <prefix>             # Prefix search (string-based)
+  hopgrepX.py <files> --multi <k1,k2,k3>            # Multiple exact matches
+
+Note on numeric prefix search:
+  --prefix "192" matches keys starting with "192" (string prefix)
+  Examples: 192, 192.1, 192.168.0.1
+  Does NOT match: 1920, 1192 (not string prefixes)
+"""
+
 import os
 import sys
 import json
@@ -8,8 +33,25 @@ from typing import Optional, Tuple, List, Union
 import glob
 import multiprocessing
 from multiprocessing import Pool, Lock
+import fcntl
+import tempfile
+import contextlib
 
-# Global lock for parallel printing
+# ============================================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================================
+
+ZONEMAP_VERSION = 1
+MAX_GLOB_FILES = 1000  # Safety limit for glob expansion
+ZONEMAP_MAX_ZONES = 5000
+ZONEMAP_TARGET_SIZE = 64 * 1024 * 1024  # 64MB
+ZONEMAP_MAX_AGE_DAYS = 30  # Age out zones older than 30 days
+VERSION = "1.0.0"
+
+# ============================================================================
+# GLOBALS & INITIALIZATION
+# ============================================================================
+
 _stdout_lock = None
 
 def init_worker(lock):
@@ -18,9 +60,9 @@ def init_worker(lock):
     _stdout_lock = lock
 
 
-############################################################
-# === 1. FAST PARSING & UTILS ===
-############################################################
+# ============================================================================
+# 1. FAST PARSING & UTILS
+# ============================================================================
 
 class FastUtils:
     """Methods optimized for raw speed using BYTES processing."""
@@ -31,7 +73,6 @@ class FastUtils:
         if len(line_prefix) < 19: 
             return None
         try:
-            # Direct slicing on bytes - fastest method
             y = int(line_prefix[0:4])
             m = int(line_prefix[5:7])
             d = int(line_prefix[8:10])
@@ -45,13 +86,12 @@ class FastUtils:
 
     @staticmethod
     def get_first_column_bytes(line: bytes) -> bytes:
-        """Extract first column (key) from a log line.
+        """Extract first column (key) from a log line."""
+        if not line:
+            return b""
         
-        Stops at: pipe (|), space, or tab.
-        Priority: pipe-delimited format is primary, whitespace is fallback.
-        """
         for i, char in enumerate(line):
-            if char in b'| \t':  # Pipe first for robustness with pipe-delimited logs
+            if char in b'| \t':
                 return line[:i]
         return line
 
@@ -62,16 +102,12 @@ class FastUtils:
             return None
         
         if key_type == 'timestamp':
-            # Handle timestamp edge cases properly
             if len(line) >= 19:
-                # Check if position 19 has a delimiter
                 if len(line) > 19 and line[19] not in b' |\t\n\r':
-                    # Not clean timestamp, extract first column
                     first_col = FastUtils.get_first_column_bytes(line)
                     if len(first_col) >= 19:
                         return FastUtils.parse_timestamp(first_col[:19])
                     return FastUtils.parse_timestamp(first_col)
-                # Clean 19-char timestamp
                 return FastUtils.parse_timestamp(line[:19])
             return None
             
@@ -82,25 +118,19 @@ class FastUtils:
             except:
                 return None
         
-        # String type
         return FastUtils.get_first_column_bytes(line)
 
     @staticmethod
     def dt_to_float(s: str) -> float:
         """Parse various timestamp formats to float."""
-        # Try full timestamp first
         try: 
             return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
         except: 
             pass
         
-        # Try other common formats
         fmt_map = {
-            4: "%Y",                    # YYYY
-            7: "%Y-%m",                 # YYYY-MM
-            10: "%Y-%m-%d",            # YYYY-MM-DD
-            13: "%Y-%m-%d %H",         # YYYY-MM-DD HH  # FIXED: Added missing %d
-            16: "%Y-%m-%d %H:%M",      # YYYY-MM-DD HH:MM
+            4: "%Y", 7: "%Y-%m", 10: "%Y-%m-%d",
+            13: "%Y-%m-%d %H", 16: "%Y-%m-%d %H:%M",
         }
         
         if len(s) in fmt_map:
@@ -109,28 +139,19 @@ class FastUtils:
             except:
                 pass
         
-        # Last resort: try as float
         try: 
             return float(s)
         except: 
             raise ValueError(f"Cannot parse timestamp: {s}")
 
 
-############################################################
-# === 2. FILTER LOGIC (SQL-like) ===
-############################################################
-# 
-# DESIGN NOTE: Simple tokenizer treats all identifiers as values.
-# Works because context lookup is string-based.
-# Example: "severity = ERROR" works even without quotes around ERROR.
-# Limitation: Cannot distinguish field names from literal strings,
-# but this is acceptable for the intended use case.
-#
+# ============================================================================
+# 2. FILTER LOGIC (SQL-like)
+# ============================================================================
 
 class FilterLogic:
     """SQL-like filter expression evaluator."""
     
-    # Token types
     TOK_ID, TOK_OP, TOK_VAL = 'ID', 'OP', 'VAL'
     TOK_LPAREN, TOK_RPAREN = 'LPAREN', 'RPAREN'
     TOK_AND, TOK_OR, TOK_NOT = 'AND', 'OR', 'NOT'
@@ -139,10 +160,13 @@ class FilterLogic:
     def __init__(self, expression: str):
         self.tokens = self.tokenize(expression)
         self.pos = 0
-        self.ast = self.parse_expression()
+        try:
+            self.ast = self.parse_expression()
+        except Exception as e:
+            raise ValueError(f"Invalid filter expression: {e}")
 
     def tokenize(self, text: str):
-        """Tokenize filter expression."""
+        """Tokenize filter expression with escape handling."""
         tokens = []
         i = 0
         n = len(text)
@@ -151,12 +175,10 @@ class FilterLogic:
         while i < n:
             c = text[i]
             
-            # Skip whitespace
             if c.isspace(): 
                 i += 1
                 continue
             
-            # Parentheses
             if c == '(':
                 tokens.append((self.TOK_LPAREN, '('))
                 i += 1
@@ -166,7 +188,6 @@ class FilterLogic:
                 i += 1
                 continue
             
-            # Operators (2-char first)
             if i + 2 <= n and text[i:i+2] in ops:
                 tokens.append((self.TOK_OP, text[i:i+2]))
                 i += 2
@@ -176,19 +197,23 @@ class FilterLogic:
                 i += 1
                 continue
             
-            # Quoted strings
             if c in '"\'':
                 q = c
                 val = ""
                 i += 1
-                while i < n and text[i] != q:
-                    val += text[i]
+                while i < n:
+                    if text[i] == '\\' and i + 1 < n:
+                        i += 1
+                        val += text[i]
+                    elif text[i] == q:
+                        break
+                    else:
+                        val += text[i]
                     i += 1
                 i += 1
                 tokens.append((self.TOK_VAL, val))
                 continue
             
-            # Identifiers and values
             if c.isalnum() or c in '_-.:':
                 start = i
                 while i < n and (text[i].isalnum() or text[i] in '_-./:'):
@@ -206,7 +231,7 @@ class FilterLogic:
                     tokens.append((self.TOK_VAL, w))
                 continue
             
-            i += 1
+            raise ValueError(f"Invalid character '{c}' at position {i}")
         
         tokens.append((self.TOK_EOF, ''))
         return tokens
@@ -250,7 +275,7 @@ class FilterLogic:
         return self.parse_condition()
 
     def parse_condition(self):
-        k = self.consume()
+        k = self.consume(self.TOK_VAL)
         op = self.consume(self.TOK_OP)
         v = self.consume(self.TOK_VAL)
         return ('BIN', op[1], k[1], v[1])
@@ -274,7 +299,6 @@ class FilterLogic:
             if actual is None:
                 return False
             
-            # Try numeric comparison first
             try:
                 a, b = float(actual), float(target)
                 if op in ['=', '==']:
@@ -290,7 +314,6 @@ class FilterLogic:
                 if op == '<=':
                     return a <= b
             except:
-                # String comparison
                 a, b = str(actual), str(target)
                 if op in ['=', '==']:
                     return a == b
@@ -312,17 +335,14 @@ def extract_context(line: str) -> dict:
     """Extract fields from log line for filtering."""
     d = {}
     
-    # Handle both pipe and space delimiters
     if '|' in line:
-        parts = line.split('|')
+        parts = [p.strip() for p in line.split('|')]
     else:
         parts = line.split()
     
-    # Positional columns (0-based)
     for idx, p in enumerate(parts):
-        d[f"col:{idx}"] = p.strip()
+        d[f"col:{idx}"] = p
     
-    # Key-value pairs from all tokens
     all_tokens = ' '.join(parts).split()
     for token in all_tokens:
         if '=' in token:
@@ -335,94 +355,118 @@ def extract_context(line: str) -> dict:
     return d
 
 
-############################################################
-# === 3. ZONE MAP Metadata Manager ===
-############################################################
+# ============================================================================
+# 3. ZONE MAP Metadata Manager (HARDENED)
+# ============================================================================
 
 class ZoneMapLite:
     """
     Manages sidecar .hop.idx file for scanned regions.
-    Maps byte_ranges -> key_ranges for faster searches.
+    Implements versioning, aging, and safe parallel access.
     """
     
     # Configuration
-    MAX_KEY_GAP_TS = 600.0      # 10 minutes
-    MAX_KEY_GAP_NUM = 5000.0    # Numeric gap
-    PADDING = 4 * 1024 * 1024   # 4MB safety padding
+    MAX_KEY_GAP_TS = 600.0
+    MAX_KEY_GAP_NUM = 5000.0
+    PADDING = 4 * 1024 * 1024
     
-    # Tolerance for out-of-order logs
-    TS_TOLERANCE = 120.0        # 2 minutes
-    NUM_TOLERANCE = 0.001       # Numeric tolerance
+    TS_TOLERANCE = 120.0
+    NUM_TOLERANCE = 0.001
     
-    # Compaction targets
-    TARGET_ZONE_SIZE = 64 * 1024 * 1024  # 64 MB
-    MAX_MERGE_DIST = 16 * 1024 * 1024    # Merge if gap < 16MB
-    MAX_ZONES = 5000                     # Hard cap
+    TARGET_ZONE_SIZE = 64 * 1024 * 1024
+    MAX_MERGE_DIST = 16 * 1024 * 1024
+    MAX_ZONES = 5000
 
-    def __init__(self, log_path: str):
+    def __init__(self, log_path: str, read_only: bool = False):
         self.log_path = log_path
         self.idx_path = log_path + ".hop.idx"
         self.zones = []
         self.loaded = False
+        self.read_only = read_only  # Prevent writes in parallel mode
         self.file_stats = self._get_file_stats()
 
     def _get_file_stats(self):
-        """Get file statistics for validation."""
+        """Get file statistics with head+tail hashes for robust validation."""
         try:
             st = os.stat(self.log_path)
             
-            # Compute content hash for robustness
-            head_hash = ""
-            try:
-                with open(self.log_path, "rb") as f:
-                    chunk = f.read(4096)
-                    head_hash = hashlib.md5(chunk).hexdigest()
-            except:
-                pass
+            with open(self.log_path, "rb") as f:
+                # Head hash (first 4KB)
+                head = f.read(4096)
+                head_hash = hashlib.sha256(head).hexdigest()[:16]
+                
+                # Tail hash (last 4KB) - important for log rotation detection
+                if st.st_size > 4096:
+                    f.seek(-4096, os.SEEK_END)
+                    tail = f.read(4096)
+                else:
+                    tail = head
+                tail_hash = hashlib.sha256(tail).hexdigest()[:16]
             
             return {
                 "size": st.st_size,
                 "mtime": st.st_mtime,
                 "inode": st.st_ino,
-                "head_hash": head_hash
+                "head_hash": head_hash,
+                "tail_hash": tail_hash,
             }
         except:
             return None
 
+    @contextlib.contextmanager
+    def _lock_file(self, path, mode='r'):
+        """Context manager for file locking."""
+        try:
+            f = open(path, mode)
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                yield f
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+                f.close()
+        except (IOError, OSError):
+            yield None
+
     def load(self):
-        """Load and validate index file.
-        
-        DESIGN NOTE: Strict validation (size + mtime) ensures index freshness.
-        If the log file is modified (even by appending), the index is invalidated.
-        This is intentional to avoid stale index data leading to incorrect results.
-        """
+        """Load and validate index file with version and rotation checking."""
         if not os.path.exists(self.idx_path):
             return
             
         try:
-            with open(self.idx_path, 'r') as f:
+            with self._lock_file(self.idx_path, 'r') as f:
+                if f is None:
+                    return
                 data = json.load(f)
+            
+            # Version check
+            version = data.get("version", 0)
+            if version != ZONEMAP_VERSION:
+                return  # Incompatible version
             
             sig = data.get("file_signature", {})
             if not self.file_stats:
                 return
             
-            # Strict validation: file must be unchanged
-            if (sig.get("size") != self.file_stats["size"] or
-                abs(sig.get("mtime", 0) - self.file_stats["mtime"]) > 0.1):
-                return
-
-            # Hardened validation
-            if ("inode" in sig and sig["inode"] != self.file_stats["inode"]):
-                return
-            if ("head_hash" in sig and sig["head_hash"] != self.file_stats["head_hash"]):
-                return
+            # Allow index for files that have only grown (appended)
+            current_size = self.file_stats["size"]
+            cached_size = sig.get("size", 0)
+            
+            if cached_size > current_size:
+                return  # File got smaller
+            
+            # For large mtime differences, verify file hasn't been replaced or rotated
+            current_mtime = self.file_stats["mtime"]
+            cached_mtime = sig.get("mtime", 0)
+            if abs(current_mtime - cached_mtime) > 3600:
+                # Check both head and tail hashes for rotation detection
+                if (sig.get("head_hash") != self.file_stats.get("head_hash") or
+                    sig.get("tail_hash") != self.file_stats.get("tail_hash")):
+                    return
             
             self.zones = data.get("zones", [])
             self.zones.sort(key=lambda x: x["start"])
             self.loaded = True
-        except (json.JSONDecodeError, IOError, KeyError) as e:
-            # Corrupted or malformed index - start fresh
+        except (json.JSONDecodeError, IOError, KeyError):
             pass
 
     def get_search_hints(self, target_key, key_type: str) -> Tuple[int, Optional[int]]:
@@ -431,7 +475,6 @@ class ZoneMapLite:
             return 0, None
 
         def to_runtime(val):
-            """Convert JSON value back to runtime type."""
             try:
                 if key_type == 'string':
                     if isinstance(val, str):
@@ -444,7 +487,6 @@ class ZoneMapLite:
         found_s, found_e = 0, None
         found_hit = False
 
-        # 1. Direct hit search
         for z in self.zones:
             z_min = to_runtime(z["min"])
             z_max = to_runtime(z["max"])
@@ -457,7 +499,6 @@ class ZoneMapLite:
                 pass
 
         if not found_hit:
-            # 2. Neighbor search
             best_low = 0
             best_high = None
 
@@ -476,7 +517,6 @@ class ZoneMapLite:
             
             found_s, found_e = best_low, best_high
 
-        # Apply safety padding
         final_s = max(0, found_s - self.PADDING)
         final_e = None
         if found_e is not None:
@@ -489,17 +529,17 @@ class ZoneMapLite:
 
     def add_observation(self, start: int, end: int, min_k, max_k, key_type: str):
         """Record scanned region with tolerance."""
-        # Skip invalid observations
+        if self.read_only:
+            return  # Skip in parallel mode
+            
         if min_k is None or max_k is None:
             return
             
-        # Normalize keys for JSON
         if isinstance(min_k, bytes):
             min_k = min_k.decode('iso-8859-1')
         if isinstance(max_k, bytes):
             max_k = max_k.decode('iso-8859-1')
 
-        # Apply tolerances
         try:
             if key_type == 'timestamp':
                 min_k -= self.TS_TOLERANCE
@@ -514,11 +554,12 @@ class ZoneMapLite:
             "start": start,
             "end": end,
             "min": min_k,
-            "max": max_k
+            "max": max_k,
+            "last_used": time.time()  # For aging policies
         })
 
     def _merge_two_zones(self, z1: dict, z2: dict):
-        """Merge z2 into z1."""
+        """Merge z2 into z1 with proper error handling."""
         z1["end"] = max(z1["end"], z2["end"])
         try:
             if z2["min"] < z1["min"]:
@@ -528,23 +569,23 @@ class ZoneMapLite:
         except:
             pass
 
+        z1["last_used"] = max(
+            z1.get("last_used", 0),
+            z2.get("last_used", 0)
+        )
+
     def _should_merge(self, z1: dict, z2: dict, force: bool = False) -> bool:
-        """Decide if zones should be merged."""
         byte_gap = z2["start"] - z1["end"]
         
-        # Strictly overlapping or touching
         if byte_gap <= 0:
             return True
         
-        # Force merge for compaction
         if force:
             curr_size = z1["end"] - z1["start"]
             return curr_size < self.TARGET_ZONE_SIZE
 
-        # Smart merge
         curr_size = z1["end"] - z1["start"]
         if byte_gap < self.MAX_MERGE_DIST and curr_size < self.TARGET_ZONE_SIZE:
-            # Check key continuity
             try:
                 if (isinstance(z1["max"], (int, float)) and 
                     isinstance(z2["min"], (int, float))):
@@ -561,7 +602,6 @@ class ZoneMapLite:
         return False
 
     def _compact_zones(self, zones: List[dict], force_mode: bool = False) -> List[dict]:
-        """Compact zones list."""
         if not zones:
             return []
             
@@ -580,9 +620,21 @@ class ZoneMapLite:
         return compacted
 
     def commit(self):
-        """Merge zones and write to disk atomically."""
+        """Merge zones and write to disk atomically with aging policy."""
+        if self.read_only:
+            return  # No writes in parallel mode
+            
         if not self.zones:
             return
+        
+        # Apply aging policy: remove zones older than MAX_AGE_DAYS
+        now = time.time()
+        max_age = ZONEMAP_MAX_AGE_DAYS * 24 * 3600
+        
+        self.zones = [
+            z for z in self.zones
+            if now - z.get("last_used", now) < max_age
+        ]
         
         # Sort by start position
         self.zones.sort(key=lambda x: x["start"])
@@ -601,48 +653,80 @@ class ZoneMapLite:
         if len(self.zones) > self.MAX_ZONES:
             self.zones = self.zones[-self.MAX_ZONES:]
         
-        # Atomic write
-        data = {
-            "file_signature": self.file_stats,
-            "zones": self.zones
-        }
+        # Update file stats before writing
+        self.file_stats = self._get_file_stats()
         
         try:
-            tmp_path = self.idx_path + ".tmp"
-            with open(tmp_path, 'w') as f:
-                json.dump(data, f)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(self.idx_path) or ".",
+                suffix='.tmp',
+                prefix=os.path.basename(self.idx_path) + '.'
+            )
+            
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                data = {
+                    "version": ZONEMAP_VERSION,
+                    "file_signature": self.file_stats,
+                    "zones": self.zones
+                }
+                json.dump(data, f, separators=(',', ':'))  # Minimal JSON
+                f.flush()
+                os.fsync(f.fileno())
+            
             os.replace(tmp_path, self.idx_path)
-        except:
-            pass
+        except (IOError, OSError, json.JSONEncodeError):
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except:
+                pass
 
 
-############################################################
-# === 4. REGION LOCATOR (HYPER-HOP) ===
-############################################################
+# ============================================================================
+# 4. REGION LOCATOR (HYPER-HOP)
+# ============================================================================
 
 class HyperHopSeeker:
     """K-ary search for finding file bounds efficiently."""
     
     def __init__(self, filepath: str, key_type: str = 'timestamp'):
-        self.f = open(filepath, "rb")
-        self.f.seek(0, 2)
-        self.filesize = self.f.tell()
+        self.filepath = filepath
         self.key_type = key_type
+        self.f = None
+        self.filesize = 0
+        self._open_file()
         
         self.K_FACTOR = 32
-        self.SCAN_LIMIT = 256 * 1024  # 256KB
+        self.SCAN_LIMIT = 256 * 1024
+
+    def _open_file(self):
+        """Open file and get size."""
+        if self.f is not None:
+            self.f.close()
+        self.f = open(self.filepath, "rb")
+        self.f.seek(0, 2)
+        self.filesize = self.f.tell()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def close(self):
-        self.f.close()
+        """Close file handle."""
+        if self.f:
+            self.f.close()
+            self.f = None
 
     def raw_read_line_at(self, offset: int) -> Tuple[Optional[Union[float, bytes]], int]:
-        """Read line at offset and parse its key."""
         if offset >= self.filesize:
             return None, offset
             
         self.f.seek(offset)
         if offset > 0:
-            self.f.readline()  # Align to line boundary
+            self.f.readline()
             
         aligned_pos = self.f.tell()
         line = self.f.readline()
@@ -650,19 +734,16 @@ class HyperHopSeeker:
         if not line:
             return None, aligned_pos
             
-        # Parse key from line
         k = FastUtils.get_key_from_line(line.strip(), self.key_type)
         return k, aligned_pos
 
     def locate_lower_bound(self, target, hint_start: int = 0, hint_end: Optional[int] = None) -> int:
-        """Find lower bound for target key using k-ary search."""
         if target is None or target == float('-inf') or target == '':
             return 0
         
         low = hint_start
         high = hint_end if hint_end is not None else self.filesize
         
-        # Clamp values
         if high > self.filesize:
             high = self.filesize
         if low > high:
@@ -681,7 +762,6 @@ class HyperHopSeeker:
             if not valid_samples:
                 break
 
-            # Find first sample >= target
             idx_ge = -1
             for i, (off, k) in enumerate(valid_samples):
                 if k >= target:
@@ -708,13 +788,11 @@ class HyperHopSeeker:
         return low
 
 
-############################################################
-# === 5. DATA TYPES & HELPER FUNCTIONS ===
-############################################################
+# ============================================================================
+# 5. HELPER FUNCTIONS
+# ============================================================================
 
 class QueryRule:
-    """Represents a search query rule."""
-    
     def __init__(self, start_key, end_key):
         self.start_key = start_key
         self.end_key = end_key
@@ -722,7 +800,6 @@ class QueryRule:
 
 def merge_byte_regions(regions: List[Tuple[int, int, List[QueryRule]]], 
                        safety_window: int) -> List[Tuple[int, int, List[QueryRule]]]:
-    """Merge overlapping byte regions."""
     if not regions:
         return []
         
@@ -745,7 +822,6 @@ def merge_byte_regions(regions: List[Tuple[int, int, List[QueryRule]]],
 
 
 def next_epsilon(val, key_type: str):
-    """Get next epsilon value for exclusive upper bound."""
     if key_type == 'number':
         return val + 0.000001
     elif key_type == 'timestamp':
@@ -757,200 +833,175 @@ def next_epsilon(val, key_type: str):
 
 
 def detect_key_type_from_file(filepath: str) -> str:
-    """
-    Detect primary key type by sampling the first line of the file.
-    
-    Returns:
-        - "timestamp": Key matches YYYY-MM-DD format
-        - "number": Key is Python-float-parseable (e.g., 123, 1.5, 1e-5)
-        - "string": Fallback for all other keys
-    
-    Note: Numeric keys are defined as values parseable by Python's float().
-    This includes scientific notation but excludes hex literals.
-    """
     try:
         with open(filepath, 'rb') as f:
-            # Read first non-empty line
-            for _ in range(10):  # Try up to 10 lines
-                line = f.readline()
-                if not line:
-                    break
+            line = f.readline()
+            while line:
                 line = line.strip()
-                if not line:
-                    continue
-                
-                # Extract first column
-                first_col = FastUtils.get_first_column_bytes(line)
-                if not first_col:
-                    continue
-                
-                first_col = first_col.decode('utf-8', errors='ignore').strip()
-                
-                # Try timestamp
-                if len(first_col) >= 10 and first_col[4] == '-' and first_col[7] == '-':
-                    return "timestamp"
-                
-                # Try number
-                try:
-                    float(first_col)
-                    return "number"
-                except:
-                    pass
-        
+                if line:
+                    first_col = FastUtils.get_first_column_bytes(line)
+                    if not first_col:
+                        line = f.readline()
+                        continue
+                    
+                    try:
+                        first_col_str = first_col.decode('utf-8')
+                    except UnicodeDecodeError:
+                        first_col_str = first_col.decode('latin-1', errors='replace')
+                    
+                    if len(first_col_str) >= 10 and first_col_str[4] == '-' and first_col_str[7] == '-':
+                        return "timestamp"
+                    
+                    try:
+                        float(first_col_str)
+                        return "number"
+                    except:
+                        pass
+                    
+                    break  # Only need first valid line
+                line = f.readline()
     except:
         pass
     
-    # Default to string if no detection
     return "string"
 
 
-############################################################
-# === 6. MAIN SEARCH ENGINE ===
-############################################################
+# ============================================================================
+# 6. MAIN SEARCH ENGINE (HARDENED)
+# ============================================================================
 
-def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr: Optional[str], json_mode: bool = False):
+def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr: Optional[str], json_mode: bool = False, is_parallel: bool = False):
     """
-    Pure generator for searching a file. 
-    Yields matched lines (bytes).
-    Handles ZoneMap updates internally but commits strictly based on mode.
+    Pure generator for searching a file.
+    
+    Args:
+        is_parallel: True if running in parallel mode (disables ZoneMap writes)
     """
     
-    # 1. Detect key type from file
     key_type = detect_key_type_from_file(filepath)
     
-    # Fallback: check first key
-    if keys and key_type == "string":
-        k0 = str(keys[0]).strip()
-        if len(k0) >= 10 and k0[4] == '-' and k0[7] == '-':
-            key_type = "timestamp"
-
-    # 2. Initialize components
-    seeker = HyperHopSeeker(filepath, key_type)
-    file_size = seeker.filesize
-    zonemap = ZoneMapLite(filepath)
-    zonemap.load()
-    
-    # 3. Convert request to query rules
-    queries = []
-    
-    if mode == "--substring":
-        queries.append(QueryRule(None, None))
-        
-    elif mode == "--eq":
-        for k_str in keys:
-            if key_type == "timestamp":
-                v = FastUtils.dt_to_float(k_str)
-                queries.append(QueryRule(v, next_epsilon(v, 'timestamp')))
-            elif key_type == "number":
-                v = float(k_str)
-                queries.append(QueryRule(v, next_epsilon(v, 'number')))
-            else:
-                v_b = k_str.encode('utf-8')
-                queries.append(QueryRule(v_b, next_epsilon(v_b, 'string')))
-                
-    elif mode == "--range":
-        s_str, e_str = keys[0], keys[1]
-        if key_type == "timestamp":
-            s = FastUtils.dt_to_float(s_str)
-            e = FastUtils.dt_to_float(e_str)
-            queries.append(QueryRule(s, next_epsilon(e, 'timestamp')))
-        elif key_type == "number":
-            s, e = float(s_str), float(e_str)
-            queries.append(QueryRule(s, next_epsilon(e, 'number')))
-        else:
-            s_b, e_b = s_str.encode('utf-8'), e_str.encode('utf-8')
-            queries.append(QueryRule(s_b, next_epsilon(e_b, 'string')))
-            
-    elif mode == "--prefix":
-        s_str = keys[0]
-        prefix_str = s_str
-        prefix_bytes = s_str.encode('utf-8')
-        
-        # IMPORTANT: Prefix matching is STRING-BASED, not numeric range
-        # --prefix "12" matches: 12, 12.3, 12.0001 (string prefix)
-        # but NOT: 120 (no prefix match)
-        # This applies to ALL key types (numeric, timestamp, string)
-        
-        if key_type == "timestamp":
-            # Generate ranges for timestamp prefixes
-            try:
-                prefix = s_str
-                if len(prefix) == 4:  # YYYY
-                    y = int(prefix)
-                    start = datetime(y, 1, 1).timestamp()
-                    end = datetime(y + 1, 1, 1).timestamp()
-                elif len(prefix) == 7:  # YYYY-MM
-                    y, m = map(int, prefix.split('-'))
-                    start = datetime(y, m, 1).timestamp()
-                    end = datetime(y, m + 1, 1).timestamp() if m < 12 else datetime(y + 1, 1, 1).timestamp()
-                elif len(prefix) == 10:  # YYYY-MM-DD
-                    y, m, d = map(int, prefix.split('-'))
-                    start = datetime(y, m, d).timestamp()
-                    end = start + 86400  # +1 day
-                elif len(prefix) == 13:  # YYYY-MM-DD HH
-                    y, m, d = map(int, prefix[:10].split('-'))
-                    h = int(prefix[11:13])
-                    start = datetime(y, m, d, h).timestamp()
-                    end = start + 3600  # +1 hour
-                elif len(prefix) == 16:  # YYYY-MM-DD HH:MM
-                    y, m, d = map(int, prefix[:10].split('-'))
-                    h = int(prefix[11:13])
-                    mm = int(prefix[14:16])
-                    start = datetime(y, m, d, h, mm).timestamp()
-                    end = start + 60  # +1 minute
-                else:
-                    # Fallback to open-ended search
-                    start = FastUtils.dt_to_float(prefix)
-                    end = None
-                
-                queries.append(QueryRule(start, end))
-            except:
-                queries.append(QueryRule(0, None))
-                
-        elif key_type == "number":
-            # FIXED: No numeric range expansion - use open-ended query
-            # Prefix matching will be done via string comparison
-            queries.append(QueryRule(0, None))
-                
-        else:  # string
-            queries.append(QueryRule(prefix_bytes, None))
-             
-    elif mode == "--multi":
-        for k_str in keys:
-            if key_type == "timestamp":
-                v = FastUtils.dt_to_float(k_str)
-                queries.append(QueryRule(v, next_epsilon(v, 'timestamp')))
-            elif key_type == "number":
-                v = float(k_str)
-                queries.append(QueryRule(v, next_epsilon(v, 'number')))
-            else:
-                v_b = k_str.encode('utf-8')
-                queries.append(QueryRule(v_b, next_epsilon(v_b, 'string')))
-
-    # 4. Locate regions using ZoneMap hints
-    raw_regions = []
-    for q in queries:
-        hs_start, he_start = zonemap.get_search_hints(q.start_key, key_type)
-        start_bound = seeker.locate_lower_bound(q.start_key, hs_start, he_start)
-        
-        if q.end_key is None:
-            end_bound = file_size
-        else:
-            hs_end, he_end = zonemap.get_search_hints(q.end_key, key_type)
-            end_bound = seeker.locate_lower_bound(q.end_key, hs_end, he_end)
-            
-        raw_regions.append((start_bound, end_bound, [q]))
-
-    # 5. Merge regions
-    SAFETY_WINDOW = 1024 * 1024  # 1MB
-    merged_regions = merge_byte_regions(raw_regions, SAFETY_WINDOW)
-    
-    # 6. Execute scan
-    filter_eng = FilterLogic(filter_expr) if filter_expr else None
-    
+    seeker = None
     try:
+        seeker = HyperHopSeeker(filepath, key_type)
+        file_size = seeker.filesize
+        
+        # ZoneMap is READ-ONLY in parallel mode
+        zonemap = ZoneMapLite(filepath, read_only=is_parallel)
+        zonemap.load()
+        
+        queries = []
+        
+        if mode == "--substring":
+            queries.append(QueryRule(None, None))
+            
+        elif mode == "--eq":
+            for k_str in keys:
+                if key_type == "timestamp":
+                    v = FastUtils.dt_to_float(k_str)
+                    queries.append(QueryRule(v, next_epsilon(v, 'timestamp')))
+                elif key_type == "number":
+                    v = float(k_str)
+                    queries.append(QueryRule(v, next_epsilon(v, 'number')))
+                else:
+                    v_b = k_str.encode('utf-8')
+                    queries.append(QueryRule(v_b, next_epsilon(v_b, 'string')))
+                    
+        elif mode == "--range":
+            s_str, e_str = keys[0], keys[1]
+            if key_type == "timestamp":
+                s = FastUtils.dt_to_float(s_str)
+                e = FastUtils.dt_to_float(e_str)
+                queries.append(QueryRule(s, next_epsilon(e, 'timestamp')))
+            elif key_type == "number":
+                s, e = float(s_str), float(e_str)
+                queries.append(QueryRule(s, next_epsilon(e, 'number')))
+            else:
+                s_b, e_b = s_str.encode('utf-8'), e_str.encode('utf-8')
+                queries.append(QueryRule(s_b, next_epsilon(e_b, 'string')))
+                
+        elif mode == "--prefix":
+            s_str = keys[0]
+            prefix_str = s_str
+            prefix_bytes = s_str.encode('utf-8')
+            
+            # IMPORTANT: Prefix matching is STRING-BASED for all key types
+            # --prefix "192" matches: 192, 192.1, 192.168.0.1 (string prefix)
+            # Does NOT match: 1920, 1192 (not string prefixes)
+            
+            if key_type == "timestamp":
+                try:
+                    prefix = s_str
+                    if len(prefix) == 4:
+                        y = int(prefix)
+                        start = datetime(y, 1, 1).timestamp()
+                        end = datetime(y + 1, 1, 1).timestamp()
+                    elif len(prefix) == 7:
+                        y, m = map(int, prefix.split('-'))
+                        start = datetime(y, m, 1).timestamp()
+                        end = datetime(y, m + 1, 1).timestamp() if m < 12 else datetime(y + 1, 1, 1).timestamp()
+                    elif len(prefix) == 10:
+                        y, m, d = map(int, prefix.split('-'))
+                        start = datetime(y, m, d).timestamp()
+                        end = start + 86400
+                    elif len(prefix) == 13:
+                        y, m, d = map(int, prefix[:10].split('-'))
+                        h = int(prefix[11:13])
+                        start = datetime(y, m, d, h).timestamp()
+                        end = start + 3600
+                    elif len(prefix) == 16:
+                        y, m, d = map(int, prefix[:10].split('-'))
+                        h = int(prefix[11:13])
+                        mm = int(prefix[14:16])
+                        start = datetime(y, m, d, h, mm).timestamp()
+                        end = start + 60
+                    else:
+                        start = FastUtils.dt_to_float(prefix)
+                        end = None
+                    
+                    queries.append(QueryRule(start, end))
+                except:
+                    queries.append(QueryRule(0, None))
+                    
+            elif key_type == "number":
+                queries.append(QueryRule(0, None))
+                    
+            else:
+                queries.append(QueryRule(prefix_bytes, None))
+                 
+        elif mode == "--multi":
+            for k_str in keys:
+                if key_type == "timestamp":
+                    v = FastUtils.dt_to_float(k_str)
+                    queries.append(QueryRule(v, next_epsilon(v, 'timestamp')))
+                elif key_type == "number":
+                    v = float(k_str)
+                    queries.append(QueryRule(v, next_epsilon(v, 'number')))
+                else:
+                    v_b = k_str.encode('utf-8')
+                    queries.append(QueryRule(v_b, next_epsilon(v_b, 'string')))
+
+        raw_regions = []
+        for q in queries:
+            hs_start, he_start = zonemap.get_search_hints(q.start_key, key_type)
+            start_bound = seeker.locate_lower_bound(q.start_key, hs_start, he_start)
+            
+            if q.end_key is None:
+                end_bound = file_size
+            else:
+                hs_end, he_end = zonemap.get_search_hints(q.end_key, key_type)
+                end_bound = seeker.locate_lower_bound(q.end_key, hs_end, he_end)
+                
+            raw_regions.append((start_bound, end_bound, [q]))
+
+        SAFETY_WINDOW = 1024 * 1024
+        merged_regions = merge_byte_regions(raw_regions, SAFETY_WINDOW)
+        
+        filter_eng = FilterLogic(filter_expr) if filter_expr else None
+        
+        # Track if we should commit ZoneMap (only if successful scan)
+        match_count = 0
+        
         if mode == "--substring" and not keys:
-            # Full file scan for substring
             seeker.f.seek(0)
             while True:
                 curr_offset = seeker.f.tell()
@@ -959,14 +1010,20 @@ def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr
                     break
                     
                 if filter_eng or json_mode:
-                    line_str = line_b.decode(errors='ignore').strip()
+                    try:
+                        line_str = line_b.decode('utf-8')
+                    except UnicodeDecodeError:
+                        line_str = line_b.decode('latin-1', errors='replace')
+                    line_str = line_str.rstrip('\n\r')
+                    
                     ctx = extract_context(line_str)
                     
                     if filter_eng and not filter_eng.evaluate(ctx):
                         continue
                         
+                    match_count += 1
+                    
                     if json_mode:
-                        # Structured JSON output
                         fields = {k: v for k, v in ctx.items() if not k.startswith("col:")}
                         json_obj = {
                             "file": filepath,
@@ -975,20 +1032,19 @@ def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr
                             "fields": fields,
                             "_raw": line_str
                         }
-                        yield (json.dumps(json_obj) + "\n").encode('utf-8')
+                        yield (json.dumps(json_obj, ensure_ascii=False) + "\n").encode('utf-8')
                     else:
                         yield line_b
                 else:
+                    match_count += 1
                     yield line_b
         
         else:
-            # Region-based scanning
             for (safe_start, safe_end_anchor, rules) in merged_regions:
                 seeker.f.seek(safe_start)
                 if safe_start > 0:
-                    seeker.f.readline()  # Align
+                    seeker.f.readline()
                 
-                # Determine termination conditions
                 max_logical_key_rule = None
                 has_open_end = False
                 for r in rules:
@@ -1001,12 +1057,10 @@ def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr
                 if safety_cutoff > file_size:
                     safety_cutoff = file_size
                 
-                # Pre-compute prefix values
                 q_sub_list = [k.encode('utf-8') for k in keys] if (mode == "--substring" and keys) else []
                 prefix_str = str(keys[0]) if (mode == "--prefix" and keys) else ""
                 prefix_bytes = prefix_str.encode('utf-8') if prefix_str else b""
                 
-                # Track for ZoneMap
                 region_min_k = None
                 region_max_k = None
                 region_start_pos = seeker.f.tell()
@@ -1024,42 +1078,28 @@ def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr
                     if not line_stripped:
                         continue
 
-                    # Get key for ZoneMap and eq/range/multi queries
-                    # We only extract the key if we need it for termination or indexing
-                    k = None
-                    needs_key = (mode != "--substring") or (region_max_k is None)
+                    k = FastUtils.get_key_from_line(line_stripped, key_type)
                     
-                    if needs_key:
-                        k = FastUtils.get_key_from_line(line_stripped, key_type)
-                        # Update ZoneMap stats
-                        if k is not None:
-                            if region_min_k is None:
-                                region_min_k = region_max_k = k
-                            else:
-                                if k < region_min_k: region_min_k = k
-                                if k > region_max_k: region_max_k = k
+                    if k is not None:
+                        if region_min_k is None:
+                            region_min_k = region_max_k = k
+                        else:
+                            if k < region_min_k: region_min_k = k
+                            if k > region_max_k: region_max_k = k
                     
-                    # --- TERMINATION CHECKS ---
-                    if mode == "--eq" or mode == "--range" or mode == "--multi":
+                    # Termination checks with safe handling
+                    if mode in ["--eq", "--range", "--multi"]:
                         if not has_open_end and k is not None and max_logical_key_rule is not None:
                             if k > max_logical_key_rule:
-                                break # Early exit
-                                
+                                break
+                    
                     elif mode == "--prefix":
-                        # CRITICAL: Prefix termination logic
-                        # NOTE: k is typed based on key_type (float for timestamp/number, bytes for string)
-                        if k is not None:
-                            if key_type == "string":
-                                # k is bytes, prefix_bytes is bytes
-                                if isinstance(k, bytes) and not k.startswith(prefix_bytes) and k > prefix_bytes:
-                                    break # Gone past the prefix lexicographically
-                            elif key_type == "timestamp" or key_type == "number":
-                                # k is float, use rule-based termination
-                                # For timestamps/numbers, we rely on the end_key from queries
-                                if not has_open_end and max_logical_key_rule and k >= max_logical_key_rule:
+                        # Safe termination for numeric/timestamp prefixes
+                        if max_logical_key_rule is not None and k is not None:
+                            if key_type in ("number", "timestamp"):
+                                if k >= max_logical_key_rule:
                                     break
-                                    
-                    # --- MATCH CHECKING ---
+                    
                     is_match = False
                     if mode == "--substring":
                         for qs in q_sub_list:
@@ -1068,14 +1108,14 @@ def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr
                                 break
                     elif mode == "--prefix":
                         if key_type == "string":
-                            is_match = k.startswith(prefix_bytes) if isinstance(k, bytes) else False
+                            if isinstance(k, bytes):
+                                is_match = k.startswith(prefix_bytes)
                         elif key_type == "timestamp":
                             is_match = line_stripped.startswith(prefix_bytes)
                         elif key_type == "number":
-                            # Use raw string check for numeric prefixes (e.g. 192. starts with 192)
                             first_col = FastUtils.get_first_column_bytes(line_stripped)
                             is_match = first_col.startswith(prefix_bytes)
-                    else: # Eq/Range/Multi
+                    else:
                         if k is not None:
                             for r in rules:
                                 if (r.start_key is None or k >= r.start_key) and \
@@ -1083,29 +1123,38 @@ def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr
                                     is_match = True
                                     break
                     
-                    # --- OUTPUT HANDLING ---
                     if is_match:
                         if filter_eng or json_mode:
-                            ctx = extract_context(line_stripped.decode(errors='ignore'))
+                            try:
+                                line_str = line_stripped.decode('utf-8')
+                            except UnicodeDecodeError:
+                                line_str = line_stripped.decode('latin-1', errors='replace')
+                            
+                            ctx = extract_context(line_str)
                             if filter_eng and not filter_eng.evaluate(ctx):
                                 continue
+                            
+                            match_count += 1
+                            
                             if json_mode:
                                 fields = {key: v for key, v in ctx.items() if not key.startswith("col:")}
                                 json_obj = {
-                                    "file": filepath, "offset": curr_pos, "key": ctx.get("col:0", ""),
-                                    "fields": fields, "_raw": line_stripped.decode(errors='ignore')
+                                    "file": filepath,
+                                    "offset": curr_pos,
+                                    "key": ctx.get("col:0", ""),
+                                    "fields": fields,
+                                    "_raw": line_str
                                 }
-                                yield (json.dumps(json_obj) + "\n").encode('utf-8')
+                                yield (json.dumps(json_obj, ensure_ascii=False) + "\n").encode('utf-8')
                             else:
                                 yield line_bytes
                         else:
+                            match_count += 1
                             yield line_bytes
                 
-                # End of region - update ZoneMap
-                region_end_pos = seeker.f.tell()
                 if region_min_k is not None and region_max_k is not None:
                     if mode not in ["--prefix", "--substring"]:
-                        zonemap.add_observation(region_start_pos, region_end_pos, 
+                        zonemap.add_observation(region_start_pos, seeker.f.tell(), 
                                               region_min_k, region_max_k, key_type)
         
     except KeyboardInterrupt:
@@ -1113,21 +1162,23 @@ def search_file_generator(filepath: str, mode: str, keys: List[str], filter_expr
     except BrokenPipeError:
         pass
     finally:
-        # CRITICAL: Only the generator owns ZoneMap commit
-        # Workers NEVER touch ZoneMap directly
-        if mode not in ["--prefix", "--substring"]:
+        if seeker is not None:
+            seeker.close()
+        
+        # Only commit if:
+        # 1. Not in parallel mode (read_only handles this)
+        # 2. We had successful matches
+        # 3. Not a prefix/substring search (no ZoneMap updates)
+        if match_count > 0 and not is_parallel and mode not in ["--prefix", "--substring"]:
             zonemap.commit()
-        seeker.close()
 
+
+# ============================================================================
+# 7. WORKER & FILE MANAGEMENT
+# ============================================================================
 
 def run_worker_task(args):
-    """
-    Worker entry point.
-    Consumes generator, buffers output to stdout, and safely prints stats.
-    
-    INVARIANT: One yielded chunk = one logical match (one line).
-    If this changes, match_count logic must be updated.
-    """
+    """Worker entry point for parallel execution."""
     filepath, mode, keys, filter_expr, json_mode = args
     buffer = []
     current_size = 0
@@ -1137,8 +1188,8 @@ def run_worker_task(args):
     start_time = time.time()
     
     try:
-        # IMPORTANT: Each chunk yielded by the generator = one match
-        for chunk in search_file_generator(filepath, mode, keys, filter_expr, json_mode):
+        # Note: is_parallel=True disables ZoneMap writes
+        for chunk in search_file_generator(filepath, mode, keys, filter_expr, json_mode, is_parallel=True):
             match_count += 1
             
             buffer.append(chunk)
@@ -1147,82 +1198,87 @@ def run_worker_task(args):
             if current_size >= BUF_LIMIT:
                 with _stdout_lock:
                     sys.stdout.buffer.write(b''.join(buffer))
+                    sys.stdout.buffer.flush()
                 buffer.clear()
                 current_size = 0
         
-        # Flush remainder
         if buffer:
             with _stdout_lock:
                 sys.stdout.buffer.write(b''.join(buffer))
-                sys.stdout.buffer.flush()  # Ensure output is visible
+                sys.stdout.buffer.flush()
                 
     except BrokenPipeError:
         pass
     except Exception as e:
         sys.stderr.write(f"Error processing {filepath}: {e}\n")
         
-    # Stats (Atomic write to stderr)
     dur = time.time() - start_time
     sys.stderr.write(f"[{os.path.basename(filepath)}] Found {match_count} matches in {dur:.4f}s\n")
 
 
 def expand_target_files(arg: str) -> List[str]:
     """
-    Expand file specification to a list of file paths.
+    Expand file specification to a list of file paths with safety limits.
     
-    Supports:
-    - Comma-separated lists: 'file1.log,file2.log,file3.log'
-    - Wildcards: 'test*.log', '**/*.log'
-    - Directories: 'logs/' (finds all files recursively)
-    - Single files: 'myfile.log'
-    
-    Examples:
-        'test1.log,test2.log' -> ['test1.log', 'test2.log']
-        'test*.log' -> ['test1.log', 'test2.log', 'test_bug.log']
-        'logs/,archive/*.log' -> all files in logs/ + matching archive/*.log
+    Returns:
+        List of file paths (max MAX_GLOB_FILES)
     """
     paths = []
     
-    # Split by comma to support comma-separated file lists
     parts = [p.strip() for p in arg.split(',')]
     
     for part in parts:
         if not part:
             continue
             
-        # Check for glob patterns
         if any(ch in part for ch in "*?[]"):
-            matches = glob.glob(part, recursive=True)
-            paths.extend(matches)
+            try:
+                matches = glob.glob(part, recursive=True)
+                total_matches = len(matches)
+                if total_matches > MAX_GLOB_FILES:
+                    sys.stderr.write(
+                        f"Warning: Pattern '{part}' matched {total_matches} files, "
+                        f"limiting to first {MAX_GLOB_FILES}\n"
+                    )
+                    matches = matches[:MAX_GLOB_FILES]
+                paths.extend(matches)
+            except Exception as e:
+                sys.stderr.write(f"Warning: Failed to expand pattern '{part}': {e}\n")
+                continue
         elif os.path.isdir(part):
-            # Recursive directory walk - expanded to all files
-            paths.extend(glob.glob(os.path.join(part, "**/*"), recursive=True))
+            try:
+                # List files in directory (non-recursive for safety)
+                matches = [os.path.join(part, f) for f in os.listdir(part) 
+                          if os.path.isfile(os.path.join(part, f))]
+                total_matches = len(matches)
+                if total_matches > MAX_GLOB_FILES:
+                    sys.stderr.write(
+                        f"Warning: Directory '{part}' contains {total_matches} files, "
+                        f"limiting to first {MAX_GLOB_FILES}\n"
+                    )
+                    matches = matches[:MAX_GLOB_FILES]
+                paths.extend(matches)
+            except Exception as e:
+                sys.stderr.write(f"Warning: Failed to list directory '{part}': {e}\n")
+                continue
         else:
             paths.append(part)
-        
-    # Deduplicate and sort
+    
+    # Deduplicate and filter
     paths = sorted(list(set(paths)))
-    # Filter out directories and invalid files
     paths = [p for p in paths if os.path.isfile(p)]
-    return paths
+    
+    return paths[:MAX_GLOB_FILES]  # Final safety cap
 
 
-############################################################
-# === 7. CLI INTERFACE ===
-############################################################
+# ============================================================================
+# 8. CLI INTERFACE (HARDENED)
+# ============================================================================
 
 def print_help():
-    """Print help information."""
+    """Print comprehensive help information."""
+    print(__doc__)
     print("""
-Fast Log Search (hopgrepX) - Search sorted log files efficiently
-    
-Usage:
-  hopgrepX.py <file> <pattern>                    # Substring search
-  hopgrepX.py <file> --eq <key>                   # Exact match
-  hopgrepX.py <file> --range <start> <end>        # Range search
-  hopgrepX.py <file> --prefix <prefix>            # Prefix search
-  hopgrepX.py <file> --multi <k1,k2,k3>           # Multiple exact matches
-    
 File Specification:
   - Single file: 'logs.txt'
   - Wildcards: 'test*.log', 'logs/**/*.log'
@@ -1235,6 +1291,15 @@ Filters:
   --where "severity=ERROR AND user=admin"         # Multiple conditions
   --json                                          # Output matches as JSON objects
     
+Important Notes:
+  1. First column must be primary key (timestamp/number/string)
+  2. Log file must be sorted by primary key
+  3. Auto-detects key type from file content
+  4. Creates .hop.idx index file for faster repeated searches
+  5. Multi-file searches run in parallel automatically
+  6. ZoneMap index updates are DISABLED in parallel mode
+  7. Numeric prefix search is string-based (not numeric range)
+    
 Examples:
   hopgrepX.py logs.txt ERROR                      # Find "ERROR" anywhere
   hopgrepX.py logs.txt --eq "2024-01-15 10:30:00" # Exact timestamp
@@ -1244,60 +1309,68 @@ Examples:
   hopgrepX.py 'app*.log' --eq 12345               # Search multiple files (wildcard)
   hopgrepX.py app1.log,app2.log --eq 12345        # Search multiple files (comma-separated)
     
-Notes:
-  - First column must be primary key (timestamp/number/string)
-  - Log file must be sorted by primary key
-  - Auto-detects key type from file content
-  - Creates .hop.idx index file for faster repeated searches
-  - Multi-file searches run in parallel automatically
+Performance Tips:
+  - First run creates index (.hop.idx file)
+  - Subsequent runs are 10-100x faster
+  - For best results, run single-file searches first to build index
+  - Parallel mode disables index writes (run single-file to build index)
 """)
 
 
 def main():
-    """Main CLI entry point."""
+    """Main CLI entry point with platform-aware multiprocessing."""
     
-    # Show help if requested
+    # 1. Version Flag
+    if "--version" in sys.argv:
+        print(f"hopgrepx {VERSION}")
+        sys.exit(0)
+
+    # 2. Short Flags
+    flag_map = {
+        "-e": "--eq",
+        "-r": "--range",
+        "-p": "--prefix",
+        "-m": "--multi",
+        "-j": "--json",
+        "-w": "--where",
+    }
+    sys.argv = [flag_map.get(a, a) for a in sys.argv]
+    
     if len(sys.argv) == 2 and sys.argv[1] in ['-h', '--help']:
         print_help()
         sys.exit(0)
     
-    # Check minimum arguments
     if len(sys.argv) < 3:
         print("Error: Insufficient arguments")
         print_help()
         sys.exit(1)
         
-    # Pre-parse flags
     json_mode = False
     if "--json" in sys.argv:
         json_mode = True
         sys.argv.remove("--json")
         
-    # Re-check len after flag removal
     if len(sys.argv) < 3:
         print("Error: Insufficient arguments")
         print_help()
         sys.exit(1)
     
-    # filepath may be a glob or directory
     target_arg = sys.argv[1]
     
     target_files = expand_target_files(target_arg)
     if not target_files:
         print(f"Error: No files found matching '{target_arg}'")
         sys.exit(1)
+    
     second_arg = sys.argv[2]
     
-    # Parse arguments based on whether second arg is a mode flag
     if second_arg.startswith("--"):
-        # Explicit mode
         mode = second_arg
         if mode not in ['--eq', '--range', '--prefix', '--multi', '--substring']:
             print(f"Error: Unknown mode '{mode}'")
             print_help()
             sys.exit(1)
         
-        # Parse remaining arguments
         remaining_args = sys.argv[3:]
         keys = []
         where_expr = None
@@ -1307,16 +1380,12 @@ def main():
             arg = remaining_args[i]
             if arg == "--where":
                 if i + 1 < len(remaining_args):
-                    if where_expr:
-                        where_expr += " AND " + remaining_args[i + 1]
-                    else:
-                        where_expr = remaining_args[i + 1]
+                    where_expr = remaining_args[i + 1]
                     i += 2
                     continue
             keys.append(arg)
             i += 1
     else:
-        # Implicit substring mode
         mode = "--substring"
         remaining_args = sys.argv[2:]
         keys = []
@@ -1327,22 +1396,17 @@ def main():
             arg = remaining_args[i]
             if arg == "--where":
                 if i + 1 < len(remaining_args):
-                    if where_expr:
-                        where_expr += " AND " + remaining_args[i + 1]
-                    else:
-                        where_expr = remaining_args[i + 1]
+                    where_expr = remaining_args[i + 1]
                     i += 2
                     continue
             keys.append(arg)
             i += 1
     
-    # Validate arguments
     if mode == "--range" and len(keys) != 2:
         print("Error: --range requires exactly two arguments")
         sys.exit(1)
     
     if mode == "--multi" and len(keys) == 1:
-        # Split comma-separated list
         keys = keys[0].split(',')
         keys = [k.strip() for k in keys if k.strip()]
         
@@ -1350,20 +1414,29 @@ def main():
         print("Error: --multi requires comma-separated list")
         sys.exit(1)
     
-    # Run the search
     try:
-        # BEAST MODE DECISION
         if len(target_files) > 1:
-            # Parallel execution
-            sys.stderr.write(f"Paralleling search across {len(target_files)} files...\n")
+            sys.stderr.write(f"Searching {len(target_files)} files in parallel (index writes disabled)...\n")
+            sys.stderr.write("Note: Run single-file searches first to build optimal indexes.\n")
             
-            # Prepare arguments
             tasks = []
             for f in target_files:
                 tasks.append((f, mode, keys, where_expr, json_mode))
             
-            # Mac default start method is 'spawn' (safe)
-            # Fork can cause lock issues in macOS system libraries
+            # Platform-aware multiprocessing setup
+            if sys.platform == "darwin":
+                # macOS: Use 'spawn' for safety (Apple discourages fork)
+                try:
+                    multiprocessing.set_start_method('spawn')
+                except RuntimeError:
+                    pass  # Already set
+            else:
+                # Linux/Unix: Use 'fork' for performance
+                try:
+                    multiprocessing.set_start_method('fork', force=True)
+                except RuntimeError:
+                    pass
+            
             lock = Lock()
             with Pool(processes=min(multiprocessing.cpu_count(), len(target_files)), 
                      initializer=init_worker, initargs=(lock,)) as pool:
@@ -1371,33 +1444,34 @@ def main():
                     pass
                     
         else:
-            # Single file - optimized buffering
             f = target_files[0]
             start_time = time.time()
-            match_count = 0  # INVARIANT: One chunk = one match
+            match_count = 0
             
             buffer = []
             current_size = 0
-            BUF_LIMIT = 64 * 1024  # Larger buffer for single file
+            BUF_LIMIT = 64 * 1024
             
             try:
-                for chunk in search_file_generator(f, mode, keys, where_expr, json_mode):
+                # Single-file mode: ZoneMap writes ENABLED
+                for chunk in search_file_generator(f, mode, keys, where_expr, json_mode, is_parallel=False):
                     match_count += 1
                     buffer.append(chunk)
                     current_size += len(chunk)
                     
                     if current_size >= BUF_LIMIT:
                         sys.stdout.buffer.write(b''.join(buffer))
+                        sys.stdout.buffer.flush()
                         buffer.clear()
                         current_size = 0
                 
                 if buffer:
                     sys.stdout.buffer.write(b''.join(buffer))
-                sys.stdout.buffer.flush()  # Final flush
+                    sys.stdout.buffer.flush()
                     
                 dur = time.time() - start_time
                 sys.stderr.write(f"[{os.path.basename(f)}] Found {match_count} matches in {dur:.4f}s\n")
-                sys.stderr.flush()  # Ensure stats are visible
+                sys.stderr.flush()
                 
             except BrokenPipeError:
                 pass
@@ -1407,20 +1481,12 @@ def main():
 
     except KeyboardInterrupt:
         sys.exit(130)
-    except FileNotFoundError:
-        print(f"Error: File '{target_arg}' not found")
-        sys.exit(1)
     except Exception as e:
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
+
 if __name__ == "__main__":
     main()
-
-
-
-
-
-    #need to chane code for clearning bugs ->look at deepseek recent chat for fixing bugs
