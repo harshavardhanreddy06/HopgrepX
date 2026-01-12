@@ -1,109 +1,114 @@
-# HopGrepX
+# hopgrepX
 
-HopGrepX is a high-performance, production-ready log search tool designed for rapidly querying large, sorted log files. It combines adaptive indexing (ZoneMap) with optimized K-ary search algorithms to deliver instant results for timestamp, numeric, and string-based queries.
+hopgrepX is a disk-aware log search engine designed for efficiently querying
+large, sorted log files under cold-cache conditions.
 
-**Version**: 1.0.0 (Production Release)
+Traditional tools like `grep` and `ripgrep` optimize CPU throughput but still
+require scanning the entire file. When logs do not fit in memory, disk I/O
+dominates runtime and full scans become prohibitively expensive. hopgrepX
+exploits key ordering (timestamps, numeric IDs, or strings) to avoid full
+file scans and drastically reduce disk reads.
 
-## 🚀 Features
+---
 
-- **Blazing Fast Search**: Uses K-ary search on sorted files to find data without scanning the whole file.
-- **Adaptive Indexing**: Automatically learns file distribution and creates lightweight sidecar indices (`.hop.idx`), making subsequent searches 10-100x faster.
-- **Multi-File Parallelism**: Native support for searching multiple files in parallel using wildcards (`*.log`) or comma-separated lists.
-- **Smart Querying**:
-    - **Equality**: Exact matches (`--eq`)
-    - **Range**: Time/Number ranges (`--range`)
-    - **Prefix**: String-based prefix matching (`--prefix`)
-    - **Multi-Match**: Search for multiple exact keys at once (`--multi`)
-    - **Implicit Substring**: Behaves like standard grep if no mode is specified.
-- **SQL-Like Filtering**: Powerful `--where` clause for complex nested logic (`AND`, `OR`, `NOT`, `( )`).
-- **JSON Output**: Structural output support (`--json`) for pipeline integration.
-- **Auto-Detection**: Automatically detects key types (Timestamp, Number, or String).
+## Motivation: Why grep is the wrong abstraction for large logs
 
-## 📋 Requirements
+Most log search tools treat log files as unstructured text and rely on
+sequential scans. This works well when data is cached in memory, but breaks
+down under cold-cache conditions where the operating system must repeatedly
+fetch data from disk.
 
-- Python 3.6+
-- No external dependencies (standard library only).
+In practice, many real-world log files are naturally sorted by a primary key
+such as timestamp or request identifier. hopgrepX leverages this ordering to
+locate relevant regions using a small number of random disk probes followed
+by a bounded sequential scan, instead of reading the entire file.
 
-## 🔧 Installation
+---
 
-Simply download the `hopgrepX.py` script and make it executable:
+## Installation
+
+hopgrepX is a standalone Python script with no external dependencies.
+
+**Requirements**: Python 3.6 or higher.
+
+1. Clone the repository or download `hopgrepX.py`:
+   ```bash
+   git clone https://github.com/yourusername/hopgrepX.git
+   cd hopgrepX
+   ```
+
+2. Make the script executable:
+   ```bash
+   chmod +x hopgrepX.py
+   ```
+
+3. (Optional) Symlink to your bin directory for global access:
+   ```bash
+   ln -s $(pwd)/hopgrepX.py /usr/local/bin/hopgrepX
+   ```
+
+---
+
+## High-level design
+
+hopgrepX follows a multi-stage search pipeline:
+
+1. **Macro search (k-ary probing)**  
+   The file is sampled at multiple offsets to quickly narrow the search
+   window containing the target key.
+
+2. **Micro refinement**  
+   The macro phase is repeated on a smaller region until the window is
+   reduced to a few hundred kilobytes.
+
+3. **Bounded sequential scan**  
+   A short sequential scan is performed within the refined window to find
+   exact matches.
+
+4. **Adaptive ZoneMap (optional)**  
+   Observed key ranges are recorded as lightweight summaries in a `.hop.idx`
+   sidecar file to accelerate future searches.
+
+This design minimizes disk I/O while remaining robust to non-uniform key
+distributions and variable-length log records.
+
+---
+
+## Supported query types
+
+hopgrepX supports multiple query modes on the **first column**, which must be
+sorted:
+
+- **Exact match** (`--eq`)
+- **Range queries** (`--range`)
+- **Prefix queries** (`--prefix`, string-based)
+- **Multiple exact matches** (`--multi`)
+- **Substring search** (default behavior, similar to `grep`)
+
+Additional filtering can be applied using a SQL-like `--where` clause.
+
+---
+
+## Example usage
 
 ```bash
-curl -O https://raw.githubusercontent.com/yourusername/hopgrepX/main/hopgrepX.py
-chmod +x hopgrepX.py
-```
+# Exact timestamp search
+./hopgrepX.py app.log --eq "2024-01-15 10:30:00"
 
-## 📖 Usage
-
-### Basic Syntax
-
-```bash
-./hopgrepX.py <files> [options]
-```
-
-### File Specifications
-
-HopGrepX supports flexible file arguments:
-- **Single File**: `app.log`
-- **Wildcards**: `logs/*.log`, `data-2024-*.txt`
-- **Lists**: `access.log,error.log` (comma-separated)
-- **Mixed**: `current.log,archive/2023-*.log`
-
-### Search Modes
-
-| Flag | Description | Example |
-|------|-------------|---------|
-| `(none)` | Substring search (linear scan or smart scan) | `./hopgrepX.py app.log "Connection failed"` |
-| `--eq` | Exact key match | `./hopgrepX.py app.log --eq "2024-01-01 12:00:00"` |
-| `--range` | Range search [start, end] | `./hopgrepX.py app.log --range 100 200` |
-| `--prefix` | String prefix match | `./hopgrepX.py app.log --prefix "2024-01"` |
-| `--multi` | Multiple exact matches | `./hopgrepX.py app.log --multi "ID:555,ID:999"` |
-
-### Advanced Filtering (`--where`)
-
-Filter results using fields extracted from the log line. Fields are auto-detected (`key=value`) or accessible by column index (`col:N`).
-
-```bash
-# Filter by extracted field 'level'
-./hopgrepX.py app.log --where "level='ERROR'"
-
-# Filter by column index 2 and 3
-./hopgrepX.py app.log --where "col:2='CRITICAL' AND col:3=500"
-
-# Complex logic
-./hopgrepX.py app.log --where "(status=500 OR latency>1000) AND env='PROD'"
-```
-
-## ⚡ Performance & Indexing
-
-1.  **First Run**: Performs a K-ary search or full scan. Simultaneously builds a sparse index in memory.
-2.  **Indexing**: On completion (for single-file runs), saves a `.hop.idx` sidecar file properly handling file rotation/updates.
-3.  **Subsequent Runs**: Loads the `.hop.idx` to jump directly to relevant file regions, drastically reducing I/O.
-    *   *Note: Index updates are skipped during parallel multi-file searches for safety.*
-
-## 💡 Examples
-
-**1. Find specific error logs in a time range:**
-```bash
+# Range query with filtering
 ./hopgrepX.py system.log \
-  --range "2023-12-01 00:00:00" "2023-12-01 23:59:59" \
+  --range "2024-01-01" "2024-01-02" \
   --where "level='ERROR'"
-```
 
-**2. Search integer IDs across all archive logs:**
-```bash
-./hopgrepX.py "archive/data-*.log" --eq 987654321
-```
-
-**3. Pipe JSON output to jq:**
-```bash
-./hopgrepX.py app.log --prefix "Warn" --json | jq .
-```
-
-**4. Numeric Prefix Search:**
-Note that `--prefix` is string-based.
-```bash
+# Prefix search (string-based)
 ./hopgrepX.py access.log --prefix "192.168"
-# Matches: 192.168.0.1, 192.168.1.55
-# Does NOT match: 1920.1.1.1
+
+# JSON output for pipelines
+./hopgrepX.py app.log --eq 12345 --json | jq .
 ```
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
