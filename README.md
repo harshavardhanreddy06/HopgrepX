@@ -1,7 +1,6 @@
-# hopgrepX
+# hopgrepX — Disk-Aware Log Search for Large Sorted Logs
 
-hopgrepX is a disk-aware log search engine designed for efficiently querying
-large, sorted log files under cold-cache conditions.
+**Avoid full scans on large logs. Reduce disk I/O by orders of magnitude under cold-cache workloads.**
 
 Traditional tools like `grep` and `ripgrep` optimize CPU throughput but still
 require scanning the entire file. When logs do not fit in memory, disk I/O
